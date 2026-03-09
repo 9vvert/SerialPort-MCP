@@ -19,6 +19,7 @@ type = "stdio"
 command = "python"
 args = ["<Path to vmconsole_mcp.py>", "--tty-path", "/tmp/vmconsole"]
 ```
+And you need to change the value of `--tty-path` according to your `socat` command's arguments.
 Then restart codex.
 
 ## Tools
