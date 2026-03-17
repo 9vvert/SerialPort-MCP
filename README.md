@@ -55,11 +55,11 @@ args = [
 Change `--tty-path` to match your named pipe. Then restart codex.
 
 ## Tools
-- `tty_status`query the current pty path and status
-- `tty_set_path`switch pty path
-- `tty_read`read data
-  - args: max_bytes`(default: 4096), `timeout_ms`(default: 120), `encoding`(`utf-8`/`latin-1`/`hex`)
-- `tty_write`write data
-  - args: data`, `append_newline`(default: false), `encoding`(`utf-8`/`hex`)
+- `tty_status` query the current pty path and status
+- `tty_set_path` switch pty path
+- `tty_read` read data
+  - args: `max_bytes`(default: 4096), `timeout_ms`(default: 120), `encoding`(`utf-8`/`latin-1`/`hex`)
+- `tty_write` write data
+  - args: `data`, `append_newline`(default: false), `encoding`(`utf-8`/`hex`)
 - `tty_control` send control-character
   - args: `key` (`c-c`, `c-z`, `c-d`, `esc`, `tab`, `enter`, `return`, `lf`, `backspace`), `repeat`(optional)
