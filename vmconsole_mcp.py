@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 import argparse
+import ctypes
 import json
 import os
 import select
 import sys
 import time
 from typing import Any, Dict, Optional
+
+if os.name == "nt":
+    from ctypes import wintypes
 
 
 class MCPError(Exception):
@@ -15,14 +19,32 @@ class MCPError(Exception):
         self.message = message
 
 
-class PTYBridge:
+class DeviceBridge:
     def __init__(self, path: str):
         self.path = path
-        self.fd: Optional[int] = None
 
     def set_path(self, path: str) -> None:
         self.path = path
         self.close()
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+    def read(self, max_bytes: int, timeout_ms: int) -> bytes:
+        raise NotImplementedError
+
+    def write(self, data: bytes) -> int:
+        raise NotImplementedError
+
+    @property
+    def is_open(self) -> bool:
+        raise NotImplementedError
+
+
+class PTYBridge(DeviceBridge):
+    def __init__(self, path: str):
+        super().__init__(path)
+        self.fd: Optional[int] = None
 
     def ensure_open(self) -> None:
         if self.fd is not None:
@@ -90,6 +112,203 @@ class PTYBridge:
         except OSError as e:
             raise MCPError(-32003, f"pty write failed: {e}") from e
 
+    @property
+    def is_open(self) -> bool:
+        return self.fd is not None
+
+
+if os.name == "nt":
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x80
+    ERROR_FILE_NOT_FOUND = 2
+    ERROR_PIPE_BUSY = 231
+    ERROR_BROKEN_PIPE = 109
+    ERROR_MORE_DATA = 234
+    ERROR_NO_DATA = 232
+
+    class WindowsNamedPipeBridge(DeviceBridge):
+        def __init__(self, path: str):
+            super().__init__(path)
+            self.handle: Optional[int] = None
+            self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            self.kernel32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            ]
+            self.kernel32.CreateFileW.restype = wintypes.HANDLE
+            self.kernel32.ReadFile.argtypes = [
+                wintypes.HANDLE,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+                wintypes.LPVOID,
+            ]
+            self.kernel32.ReadFile.restype = wintypes.BOOL
+            self.kernel32.WriteFile.argtypes = [
+                wintypes.HANDLE,
+                wintypes.LPCVOID,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+                wintypes.LPVOID,
+            ]
+            self.kernel32.WriteFile.restype = wintypes.BOOL
+            self.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            self.kernel32.CloseHandle.restype = wintypes.BOOL
+            self.kernel32.PeekNamedPipe.argtypes = [
+                wintypes.HANDLE,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+                ctypes.POINTER(wintypes.DWORD),
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            self.kernel32.PeekNamedPipe.restype = wintypes.BOOL
+            self.kernel32.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+            self.kernel32.WaitNamedPipeW.restype = wintypes.BOOL
+
+        def ensure_open(self) -> None:
+            if self.handle is not None:
+                return
+
+            while True:
+                handle = self.kernel32.CreateFileW(
+                    self.path,
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    None,
+                )
+                if handle != INVALID_HANDLE_VALUE:
+                    self.handle = handle
+                    return
+
+                err = ctypes.get_last_error()
+                if err == ERROR_PIPE_BUSY:
+                    waited = self.kernel32.WaitNamedPipeW(self.path, 2000)
+                    if waited:
+                        continue
+                raise MCPError(-32001, f"failed to open windows pipe {self.path}: winerror={err}")
+
+        def close(self) -> None:
+            if self.handle is not None:
+                try:
+                    self.kernel32.CloseHandle(self.handle)
+                finally:
+                    self.handle = None
+
+        def _peek_available(self) -> int:
+            self.ensure_open()
+            assert self.handle is not None
+
+            total_avail = wintypes.DWORD(0)
+            ok = self.kernel32.PeekNamedPipe(
+                self.handle,
+                None,
+                0,
+                None,
+                ctypes.byref(total_avail),
+                None,
+            )
+            if ok:
+                return int(total_avail.value)
+
+            err = ctypes.get_last_error()
+            if err in (ERROR_BROKEN_PIPE, ERROR_NO_DATA):
+                self.close()
+                return 0
+            raise MCPError(-32002, f"pipe peek failed: winerror={err}")
+
+        def read(self, max_bytes: int, timeout_ms: int) -> bytes:
+            self.ensure_open()
+            assert self.handle is not None
+
+            deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+            chunks = []
+            remaining = max(1, max_bytes)
+
+            while remaining > 0:
+                available = self._peek_available()
+                if available <= 0:
+                    if chunks or time.monotonic() >= deadline:
+                        break
+                    time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+                    continue
+
+                to_read = min(available, remaining)
+                buf = ctypes.create_string_buffer(to_read)
+                read_len = wintypes.DWORD(0)
+                ok = self.kernel32.ReadFile(
+                    self.handle,
+                    buf,
+                    to_read,
+                    ctypes.byref(read_len),
+                    None,
+                )
+                if not ok:
+                    err = ctypes.get_last_error()
+                    if err in (ERROR_BROKEN_PIPE, ERROR_NO_DATA):
+                        self.close()
+                        break
+                    raise MCPError(-32002, f"pipe read failed: winerror={err}")
+
+                data = buf.raw[: read_len.value]
+                if not data:
+                    break
+                chunks.append(data)
+                remaining -= len(data)
+
+                if self._peek_available() <= 0:
+                    break
+
+            return b"".join(chunks)
+
+        def write(self, data: bytes) -> int:
+            self.ensure_open()
+            assert self.handle is not None
+
+            payload = ctypes.create_string_buffer(data)
+            written = wintypes.DWORD(0)
+            ok = self.kernel32.WriteFile(
+                self.handle,
+                payload,
+                len(data),
+                ctypes.byref(written),
+                None,
+            )
+            if not ok:
+                err = ctypes.get_last_error()
+                raise MCPError(-32003, f"pipe write failed: winerror={err}")
+            return int(written.value)
+
+        @property
+        def is_open(self) -> bool:
+            return self.handle is not None
+else:
+    class WindowsNamedPipeBridge(DeviceBridge):
+        def __init__(self, path: str):
+            super().__init__(path)
+            raise RuntimeError("Windows named pipe mode is only available on Windows")
+
+
+def create_bridge(path: str, pipe_style: str) -> DeviceBridge:
+    if pipe_style == "linux":
+        return PTYBridge(path)
+    if pipe_style == "windows":
+        if os.name != "nt":
+            raise RuntimeError("windows pipe style requires running this server on Windows")
+        return WindowsNamedPipeBridge(path)
+    raise RuntimeError(f"unsupported pipe style: {pipe_style}")
+
 
 class MCPServer:
     CONTROL_MAP = {
@@ -104,8 +323,9 @@ class MCPServer:
         "backspace": b"\x7f",
     }
 
-    def __init__(self, tty_path: str):
-        self.bridge = PTYBridge(tty_path)
+    def __init__(self, tty_path: str, pipe_style: str):
+        self.bridge = create_bridge(tty_path, pipe_style)
+        self.pipe_style = pipe_style
         self.initialized = False
         self.transport_mode: Optional[str] = None  # "content_length" | "json_line"
 
@@ -184,7 +404,8 @@ class MCPServer:
         if name == "tty_status":
             status = {
                 "path": self.bridge.path,
-                "open": self.bridge.fd is not None,
+                "open": self.bridge.is_open,
+                "pipe_style": self.pipe_style,
             }
             return self._tool_text(json.dumps(status, ensure_ascii=False))
 
@@ -373,14 +594,20 @@ class MCPServer:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MCP server for interacting with /tmp/vmconsole PTY")
-    parser.add_argument("--tty-path", default="/tmp/vmconsole", help="PTY path, default: /tmp/vmconsole")
+    parser = argparse.ArgumentParser(description="MCP server for interacting with a Linux PTY or Windows named pipe")
+    parser.add_argument("--tty-path", default="/tmp/vmconsole", help="Device path, default: /tmp/vmconsole")
+    parser.add_argument(
+        "--pipe-style",
+        choices=["linux", "windows"],
+        default="linux",
+        help="Backend style: linux for POSIX PTY, windows for Windows named pipe",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    server = MCPServer(tty_path=args.tty_path)
+    server = MCPServer(tty_path=args.tty_path, pipe_style=args.pipe_style)
     try:
         server.run()
     finally:
