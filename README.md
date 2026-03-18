@@ -19,7 +19,7 @@ For BSD systems, you usually edit `loader.conf`, which may be at `/boot/loader.c
 Add these lines (adjust speed if needed):
 ```
 boot_serial="YES"
-comconsole="9600"
+comconsole_speed="9600"
 boot_multicons="YES"
 console="comconsole,vidconsole"
 ```
